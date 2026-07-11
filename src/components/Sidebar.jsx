@@ -1,5 +1,6 @@
 import React, { useState } from "react";
-import { Plus, MessageSquare, Trash2, X, GraduationCap, ChevronLeft, Menu } from "lucide-react";
+import { Plus, MessageSquare, Trash2, X, GraduationCap, ChevronLeft } from "lucide-react";
+import { getAvailableTracks } from "../data/roadmaps";
 
 export default function Sidebar({
   tracks,
@@ -8,7 +9,8 @@ export default function Sidebar({
   onCreateTrack,
   onDeleteTrack,
   isOpen,
-  setIsOpen
+  setIsOpen,
+  sessionId
 }) {
   const [showNewTrackModal, setShowNewTrackModal] = useState(false);
   const [trackName, setTrackName] = useState("");
@@ -127,7 +129,7 @@ export default function Sidebar({
         {/* Footer */}
         <div className="p-4 border-t border-[#2d2d2d] bg-bgSecondary/50 text-[11px] text-neutral-500 flex flex-col gap-1">
           <p>Session-based Anonymous Mode</p>
-          <p className="truncate font-mono">UID: {localStorage.getItem("learnmate_session_id")?.substring(0, 18)}...</p>
+          <p className="truncate font-mono">UID: {sessionId ? sessionId.substring(0, 18) : "...loading"}...</p>
         </div>
       </aside>
 
@@ -149,7 +151,7 @@ export default function Sidebar({
                   Select a Topic
                 </label>
                 <div className="grid grid-cols-2 gap-2 mb-3">
-                  {["Frontend Development", "Cybersecurity", "Data Science", "Python Programming"].map((preset) => (
+                  {getAvailableTracks().map((preset) => (
                     <button
                       key={preset}
                       type="button"

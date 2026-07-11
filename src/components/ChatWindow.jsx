@@ -5,11 +5,24 @@ import { parseAgentResponse } from "../utils/quizParser";
 
 export default function ChatWindow({ messages, isLoading, onSelectOption, trackName }) {
   const bottomRef = useRef(null);
+  const prevMessageCountRef = useRef(0);
 
-  // Smooth scroll to bottom when messages change or loading state toggles
+  // B7 fix: Only scroll to bottom when a new message is actually added,
+  // not on every isLoading toggle (which caused scroll jank while reading).
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, isLoading]);
+    const currentCount = messages.length;
+    if (currentCount > prevMessageCountRef.current) {
+      bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+    }
+    prevMessageCountRef.current = currentCount;
+  }, [messages]);
+
+  // Also scroll when loading starts (typing indicator appears)
+  useEffect(() => {
+    if (isLoading) {
+      bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+    }
+  }, [isLoading]);
 
   return (
     <div className="flex-1 overflow-y-auto px-4 md:px-8 py-6 space-y-6">
@@ -28,6 +41,8 @@ export default function ChatWindow({ messages, isLoading, onSelectOption, trackN
       ) : (
         <div className="max-w-3xl mx-auto space-y-6">
           {messages.map((msg, index) => {
+            // B6 fix: use a stable key instead of bare array index
+            const msgKey = `${msg.sender}-${index}-${msg.text.length}`;
             const isUser = msg.sender === "user";
             
             // Check if this is the last agent message in the list
@@ -35,7 +50,7 @@ export default function ChatWindow({ messages, isLoading, onSelectOption, trackN
 
             if (isUser) {
               return (
-                <div key={index} className="flex items-start justify-end gap-3 animate-fadeIn">
+                <div key={msgKey} className="flex items-start justify-end gap-3 animate-fadeIn">
                   <div className="max-w-[85%] bg-chatUser border border-[#3d3d3d] text-textPrimary rounded-2xl py-3 px-4 shadow-md">
                     <p className="text-sm leading-relaxed whitespace-pre-wrap">{msg.text}</p>
                   </div>
@@ -50,7 +65,7 @@ export default function ChatWindow({ messages, isLoading, onSelectOption, trackN
             const parsed = parseAgentResponse(msg.text);
 
             return (
-              <div key={index} className="flex items-start gap-3 animate-fadeIn">
+              <div key={msgKey} className="flex items-start gap-3 animate-fadeIn">
                 <div className="flex items-center justify-center w-8 h-8 rounded-full bg-accent/15 text-accent shrink-0 mt-0.5 border border-accent/25">
                   <GraduationCap className="w-5 h-5" />
                 </div>

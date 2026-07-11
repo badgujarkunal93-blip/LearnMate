@@ -103,22 +103,16 @@ async function getCloudantIAMToken() {
 
 /**
  * Compiles HTTP headers using an IAM bearer token.
+ * Throws if token retrieval fails — callers handle the error so they
+ * don't silently send unauthenticated requests that always 401.
  */
 async function getCloudantHeaders() {
-  try {
-    const token = await getCloudantIAMToken();
-    return {
-      "Content-Type": "application/json",
-      "Accept": "application/json",
-      "Authorization": `Bearer ${token}`
-    };
-  } catch (error) {
-    console.error("Cloudant Service: Failed to get IAM token for headers:", error);
-    return {
-      "Content-Type": "application/json",
-      "Accept": "application/json"
-    };
-  }
+  const token = await getCloudantIAMToken();
+  return {
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+    "Authorization": `Bearer ${token}`
+  };
 }
 
 export const dbService = {
@@ -141,17 +135,17 @@ export const dbService = {
   },
 
   syncLocalTracksCache(sessionId, tracks) {
-    // Clear old cache entries first
+    // Clear old cache entries first — use the same "cache_" prefix
+    // that individual saves and the fallback reader both use.
     for (let i = localStorage.length - 1; i >= 0; i--) {
       const key = localStorage.key(i);
       if (key && key.startsWith(`cache_${sessionId}_`)) {
         localStorage.removeItem(key);
       }
     }
-    // Write new cache
+    // Write new cache with keys matching the pattern: cache_{sessionId}_{trackName}
     tracks.forEach((track) => {
-      const docId = track.id;
-      localStorage.setItem(`cache_${docId}`, JSON.stringify(track));
+      localStorage.setItem(`cache_${track.id}`, JSON.stringify(track));
     });
   },
 
@@ -205,7 +199,11 @@ export const dbService = {
   },
 
   /**
-   * Fetches all tracks where document _id starts with sessionId using a Mango selector query.
+   * Fetches all tracks where document _id starts with sessionId.
+   * Uses a native CouchDB/Cloudant _all_docs range query (startkey/endkey) instead
+   * of a Mango $regex selector. Range queries use the primary index directly and
+   * are dramatically faster than an unindexed regex scan, especially as the
+   * database grows.
    */
   async fetchTracks(sessionId) {
     const url = import.meta.env.VITE_CLOUDANT_URL;
@@ -216,39 +214,35 @@ export const dbService = {
     }
 
     const proxiedUrl = getProxiedUrl(url, "/api/cloudant");
-    const findUrl = `${proxiedUrl}/${dbName}/_find`;
-    console.log(`Cloudant CRUD: Fetching tracks from ${findUrl} with sessionId prefix...`);
+    // startkey = sessionId itself, endkey = sessionId + high unicode char,
+    // giving us every doc whose _id begins with "{sessionId}_" in one fast pass.
+    const startKey = encodeURIComponent(JSON.stringify(sessionId));
+    const endKey = encodeURIComponent(JSON.stringify(sessionId + "\ufff0"));
+    const allDocsUrl = `${proxiedUrl}/${dbName}/_all_docs?include_docs=true&startkey=${startKey}&endkey=${endKey}`;
+    console.log(`Cloudant CRUD: Fetching tracks via _all_docs range query...`);
 
     try {
-      const response = await fetchWithTimeout(findUrl, {
-        method: "POST",
-        headers: await getCloudantHeaders(),
-        body: JSON.stringify({
-          selector: {
-            _id: {
-              $regex: `^${sessionId}`
-            }
-          },
-          limit: 100
-        })
+      const response = await fetchWithTimeout(allDocsUrl, {
+        method: "GET",
+        headers: await getCloudantHeaders()
       });
 
       if (!response.ok) {
-        throw new Error(`Cloudant find failed: ${response.statusText}`);
+        throw new Error(`Cloudant _all_docs failed: ${response.statusText}`);
       }
 
       const data = await response.json();
-      const docs = data.docs || [];
-
-      // Sort documents by lastUpdated ISO timestamp descending
-      docs.sort((a, b) => new Date(b.lastUpdated) - new Date(a.lastUpdated));
+      const docs = (data.rows || []).map((row) => row.doc).filter(Boolean);
 
       // Map Cloudant document fields back to App React state structure
+      // (_rev is carried through so future saves can skip the extra GET)
       const tracks = docs.map((doc) => ({
         id: doc._id,
+        rev: doc._rev,
         name: doc.trackName,
         stage: doc.currentStage,
         messages: doc.messages || [],
+        assessment: doc.assessment || null,
         updatedAt: doc.lastUpdated ? Date.parse(doc.lastUpdated) : Date.now()
       }));
 
@@ -262,9 +256,35 @@ export const dbService = {
   },
 
   /**
-   * Helper that executes the actual GET revision fetch and PUT write cycle in Cloudant.
+   * Fetches the current _rev for a document. Returns null only on a genuine 404
+   * (document does not exist yet). Any other failure (timeout, auth, network)
+   * is re-thrown so callers don't silently mistake a transient error for "new doc".
    */
-  async saveTrackDirect(sessionId, trackName, trackData) {
+  async _fetchRev(docUrl) {
+    const getRes = await fetchWithTimeout(docUrl, {
+      method: "GET",
+      headers: await getCloudantHeaders()
+    });
+    if (getRes.status === 404) {
+      return null; // genuinely a new document
+    }
+    if (!getRes.ok) {
+      throw new Error(`Cloudant GET (rev lookup) failed: ${getRes.status} ${getRes.statusText}`);
+    }
+    const existingDoc = await getRes.json();
+    return existingDoc._rev;
+  },
+
+  /**
+   * Helper that performs the Cloudant PUT write.
+   * If a known `_rev` is already held in memory (passed in via trackData.rev),
+   * skips the GET entirely and writes directly - this is the common case for
+   * every message sent within an already-loaded track, cutting the round trip
+   * count for a save from 2 down to 1.
+   * Falls back to fetching _rev when none is cached, and retries once with a
+   * freshly-fetched _rev if Cloudant returns a 409 conflict.
+   */
+  async saveTrackDirect(sessionId, trackName, trackData, attempt = 0) {
     const url = import.meta.env.VITE_CLOUDANT_URL;
     const dbName = import.meta.env.VITE_CLOUDANT_DB;
     const docId = `${sessionId}_${trackName}`;
@@ -272,23 +292,13 @@ export const dbService = {
     const proxiedUrl = getProxiedUrl(url, "/api/cloudant");
     const docUrl = `${proxiedUrl}/${dbName}/${encodeURIComponent(docId)}`;
 
-    console.log(`Cloudant CRUD: Initiating upsert cycle for document: ${docId}`);
+    console.log(`Cloudant CRUD: Upserting document: ${docId} (attempt ${attempt + 1})`);
 
-    // 1. Fetch existing revision ID (_rev) to handle CouchDB concurrency requirements
-    let rev = null;
-    try {
-      const getRes = await fetchWithTimeout(docUrl, {
-        method: "GET",
-        headers: await getCloudantHeaders()
-      });
-      if (getRes.ok) {
-        const existingDoc = await getRes.json();
-        rev = existingDoc._rev;
-        console.log(`Cloudant CRUD: Found existing document revision: ${rev}`);
-      }
-    } catch (e) {
-      // Document is new, proceed with write without revision tag
-      console.log("Cloudant CRUD: Document does not exist. Creating new record.");
+    // 1. Use the cached _rev if we already have one (avoids a GET round trip).
+    //    Only fetch _rev from Cloudant when we don't already know it.
+    let rev = trackData.rev || null;
+    if (!rev) {
+      rev = await this._fetchRev(docUrl);
     }
 
     // 2. Assemble Cloudant document payload
@@ -297,6 +307,7 @@ export const dbService = {
       trackName: trackName,
       currentStage: trackData.stage || "Beginner",
       messages: trackData.messages || [],
+      assessment: trackData.assessment || null,
       lastUpdated: new Date().toISOString(),
       sessionId: sessionId
     };
@@ -312,56 +323,58 @@ export const dbService = {
       body: JSON.stringify(body)
     });
 
+    // On a 409 conflict (our cached _rev was stale), fetch the real _rev fresh
+    // and retry exactly once rather than failing the whole save.
+    if (putResponse.status === 409 && attempt === 0) {
+      console.warn("Cloudant CRUD: 409 conflict (stale _rev). Refetching and retrying once...");
+      return this.saveTrackDirect(sessionId, trackName, { ...trackData, rev: null }, attempt + 1);
+    }
+
     if (!putResponse.ok) {
       const errText = await putResponse.text();
       throw new Error(`Cloudant PUT failed: ${putResponse.statusText} - ${errText}`);
     }
 
-    console.log(`Cloudant CRUD: Document ${docId} successfully saved.`);
-    
+    const putResult = await putResponse.json();
+    console.log(`Cloudant CRUD: Document ${docId} successfully saved (rev ${putResult.rev}).`);
+
     const result = {
       id: docId,
+      rev: putResult.rev, // carry the new _rev forward so the NEXT save skips its GET too
       name: trackName,
       stage: body.currentStage,
       messages: body.messages,
+      assessment: body.assessment,
       updatedAt: Date.parse(body.lastUpdated)
     };
-    
+
     // Cache the updated result locally
     localStorage.setItem(`cache_${docId}`, JSON.stringify(result));
     return result;
   },
 
   /**
-   * Saves a track with recursive single-retry handling.
+   * Saves a track to Cloudant.
    * Optimistically caches locally to localStorage first to guarantee zero data loss.
+   * saveTrackDirect already handles 409 conflicts with a single internal retry,
+   * so no outer retry loop is needed here.
    */
   async saveTrack(sessionId, trackName, trackData) {
     const docId = `${sessionId}_${trackName}`;
     const localRecord = {
       id: docId,
+      rev: trackData.rev || null,
       name: trackName,
       stage: trackData.stage || "Beginner",
       messages: trackData.messages || [],
+      assessment: trackData.assessment || null,
       updatedAt: Date.now()
     };
     
     // Always write to localStorage cache first to prevent losing message histories
     localStorage.setItem(`cache_${docId}`, JSON.stringify(localRecord));
 
-    try {
-      return await this.saveTrackDirect(sessionId, trackName, trackData);
-    } catch (error) {
-      console.warn(`Cloudant CRUD: Save failed for track "${trackName}". Retrying once...`, error);
-      // Wait 300ms and try one more time
-      await new Promise((resolve) => setTimeout(resolve, 300));
-      try {
-        return await this.saveTrackDirect(sessionId, trackName, trackData);
-      } catch (retryError) {
-        console.error(`Cloudant CRUD: Retry also failed for track "${trackName}":`, retryError);
-        throw retryError; // Propagate error to trigger toast notification in App.jsx
-      }
-    }
+    return await this.saveTrackDirect(sessionId, trackName, trackData);
   },
 
   /**
@@ -406,23 +419,11 @@ export const dbService = {
   },
 
   /**
-   * Deletes a track with single-retry handling.
+   * Deletes a track from Cloudant and local cache.
    */
   async deleteTrack(sessionId, trackName) {
     const docId = `${sessionId}_${trackName}`;
     localStorage.removeItem(`cache_${docId}`);
-
-    try {
-      return await this.deleteTrackDirect(sessionId, trackName);
-    } catch (error) {
-      console.warn(`Cloudant CRUD: Delete failed for "${trackName}". Retrying once...`, error);
-      await new Promise((resolve) => setTimeout(resolve, 300));
-      try {
-        return await this.deleteTrackDirect(sessionId, trackName);
-      } catch (retryError) {
-        console.error(`Cloudant CRUD: Retry delete also failed for "${trackName}":`, retryError);
-        throw retryError;
-      }
-    }
+    return await this.deleteTrackDirect(sessionId, trackName);
   }
 };

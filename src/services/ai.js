@@ -84,7 +84,7 @@ async function getIAMToken() {
  * @param {string} trackName Name of the learning track (e.g. "Frontend Development")
  * @returns {Promise<string>} The agent's response text containing optional quiz tags
  */
-export async function sendMessageToAgent(userMessage, history = [], trackName = "") {
+export async function sendMessageToAgent(userMessage, history = [], trackName = "", stage = "Beginner") {
   const apiUrl = import.meta.env.VITE_WATSONX_API_URL;
   const agentId = import.meta.env.VITE_WATSONX_AGENT_ID;
 
@@ -95,25 +95,28 @@ export async function sendMessageToAgent(userMessage, history = [], trackName = 
   // 1. Retrieve the IAM token (fetches fresh or returns cached token)
   const token = await getIAMToken();
 
-  // 2. Prepend a system prompt to reinforce the quiz and roadmap guidelines
-  const systemPrompt = `You are LearnMate, a friendly AI tutor and study assistant.
-When the user starts a new track, administer a 3-question diagnostic quiz (one question at a time) to assess their level (Beginner, Intermediate, or Advanced) in the context of: "${trackName}".
-You MUST output quiz questions and options using the following tags:
-[QUIZ_QUESTION]Your assessment question here[/QUIZ_QUESTION]
-[OPTIONS]Option A|Option B|Option C[/OPTIONS]
+  // 2. Build the messages array for the chat completions API.
+  // Since the diagnostic quiz and roadmap presentation are handled locally in our codebase,
+  // by the time we call this endpoint the user is already placed in a specific track/stage.
+  // We instruct the agent to act strictly as a helpful tutor/coach for that track and stage.
 
-After the user answers the 3rd question, evaluate their performance, explicitly calibrate their skill level (outputting it as "**Beginner**", "**Intermediate**", or "**Advanced**" in bold), and list a custom learning roadmap.
-Once the assessment is complete, transition to general tutoring. For general tutoring, reply conversationally without any [QUIZ_QUESTION] or [OPTIONS] tags. Use markdown for formatting, like bold text and bullet points.`;
-
-  // 3. Map user history to OpenAI Chat Completions message objects
   const mappedMessages = history.map((msg) => ({
     role: msg.sender === "user" ? "user" : "assistant",
     content: msg.text
   }));
 
-  // Combine system prompt with history
+  const systemContent = `You are LearnMate, a friendly, encouraging personal course roadmap coach and tutor.
+The student has selected the "${trackName}" learning track and is currently studying at the **${stage}** level.
+
+YOUR ROLE:
+- Act as a helpful tutor and coach for the "${trackName}" track at the **${stage}** level.
+- Help them learn the topics, clarify concepts, and guide them on their milestone project.
+- Answer their questions, explain ideas clearly, and recommend study materials.
+- Do NOT ask them which track they want, do NOT try to restart any skill checks or diagnostic quizzes, and do NOT ask how they want to start.
+- Keep your answers concise, well-structured, and encouraging. Use markdown formatting like bold text and bullet points.`;
+
   const completionsMessages = [
-    { role: "system", content: systemPrompt },
+    { role: "system", content: systemContent },
     ...mappedMessages
   ];
 
@@ -133,7 +136,7 @@ Once the assessment is complete, transition to general tutoring. For general tut
     body: JSON.stringify({
       messages: completionsMessages,
       model: "ibm/granite-13b-chat-v2",
-      temperature: 0.7,
+      temperature: 0.3,
       stream: false
     })
   });

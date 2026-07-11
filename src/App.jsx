@@ -1,9 +1,16 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef, useCallback } from "react";
 import Sidebar from "./components/Sidebar";
 import ChatWindow from "./components/ChatWindow";
 import ChatInput from "./components/ChatInput";
 import { dbService } from "./services/db";
 import { sendMessageToAgent } from "./services/ai";
+import {
+  generateGreeting,
+  createAssessmentState,
+  getAssessmentState,
+  processAssessmentAnswer,
+  isAssessmentInProgress
+} from "./services/assessment";
 import { Menu, Plus, GraduationCap } from "lucide-react";
 
 // Generate a simple UUID
@@ -33,13 +40,41 @@ export default function App() {
   // Real Integration: Non-blocking Toast notification state
   const [toast, setToast] = useState(null);
 
-  // Trigger non-blocking toast notification
-  const showToast = (message, type = "error") => {
+  // B5 fix: track toast timeout ID so we can clear it on unmount / new toast
+  const toastTimeoutRef = useRef(null);
+
+  // B4 fix: ref-based guard to prevent double-send race condition
+  const sendingRef = useRef(false);
+
+  // B1 fix: keep a ref that always tracks the latest activeTrackId so async
+  // callbacks don't close over a stale value
+  const activeTrackIdRef = useRef(activeTrackId);
+  useEffect(() => {
+    activeTrackIdRef.current = activeTrackId;
+  }, [activeTrackId]);
+
+  // B2/B5 fix: Trigger non-blocking toast notification, clearing any previous timeout
+  const showToast = useCallback((message, type = "error") => {
+    // Clear any pending timeout from a previous toast so it doesn't
+    // prematurely dismiss the new one
+    if (toastTimeoutRef.current) {
+      clearTimeout(toastTimeoutRef.current);
+    }
     setToast({ message, type });
-    setTimeout(() => {
+    toastTimeoutRef.current = setTimeout(() => {
       setToast(null);
+      toastTimeoutRef.current = null;
     }, 4500);
-  };
+  }, []);
+
+  // B5 fix: clean up toast timeout on unmount
+  useEffect(() => {
+    return () => {
+      if (toastTimeoutRef.current) {
+        clearTimeout(toastTimeoutRef.current);
+      }
+    };
+  }, []);
 
   // Startup Database initialization and tracks loading
   useEffect(() => {
@@ -69,10 +104,12 @@ export default function App() {
   const loadTracks = async (sid) => {
     try {
       const data = await dbService.fetchTracks(sid);
-      setTracks(data);
-      if (data.length > 0) {
+      // Sort once after loading
+      const sorted = [...data].sort((a, b) => b.updatedAt - a.updatedAt);
+      setTracks(sorted);
+      if (sorted.length > 0) {
         // Automatically select the most recently updated track
-        setActiveTrackId(data[0].id);
+        setActiveTrackId(sorted[0].id);
       }
     } catch (e) {
       console.error("Failed to load tracks from Cloudant:", e);
@@ -92,54 +129,57 @@ export default function App() {
 
   // Create a New Track
   const handleCreateTrack = async (name, stage) => {
-    setIsLoading(true);
+    // B3 fix: prevent duplicate track names
     const tempTrackId = `${sessionId}_${name}`;
+    if (tracks.some((t) => t.id === tempTrackId)) {
+      showToast(`A track named "${name}" already exists.`, "error");
+      return;
+    }
+
+    setIsLoading(true);
     setActiveTrackId(tempTrackId);
 
     try {
-      // 1. Fetch introductory message and first quiz question from Watson agent
-      console.log(`watsonx Call: Initializing track completions for: "${name}"`);
-      const response = await sendMessageToAgent("", [], name);
-      setIsOnline(true); // API succeeded, mark online
+      // 1. Generate local initial greeting (no watsonx call required!)
+      const greeting = generateGreeting(name);
+      const assessmentState = createAssessmentState();
 
       const newTrack = {
         name,
         stage,
-        messages: [{ sender: "agent", text: response }],
+        messages: [{ sender: "agent", text: greeting }],
+        assessment: assessmentState,
         updatedAt: Date.now()
       };
 
       // 2. Cloudant CRUD: Save new track document to database
+      let savedRev = null;
       try {
-        await dbService.saveTrack(sessionId, name, newTrack);
+        const saved = await dbService.saveTrack(sessionId, name, newTrack);
+        savedRev = saved.rev;
       } catch (dbErr) {
         // Handle Cloudant failure gracefully: show toast but retain in memory
         console.error("Cloudant CRUD: Save new track document failed:", dbErr);
         showToast("Cloudant sync failed. Track created locally.");
-        
-        const localTrackRecord = {
-          id: tempTrackId,
-          sessionId,
-          name,
-          stage,
-          messages: [{ sender: "agent", text: response }],
-          updatedAt: Date.now()
-        };
-        setTracks(prev => [localTrackRecord, ...prev]);
-        setActiveTrackId(tempTrackId);
-        setIsLoading(false);
-        return;
       }
 
-      // Reload list if successful
-      const updatedList = await dbService.fetchTracks(sessionId);
-      setTracks(updatedList);
+      // Prepend the new track directly to local state
+      const localTrackRecord = {
+        id: tempTrackId,
+        rev: savedRev,
+        sessionId,
+        name,
+        stage,
+        messages: [{ sender: "agent", text: greeting }],
+        assessment: assessmentState,
+        updatedAt: Date.now()
+      };
+      setTracks((prev) => [localTrackRecord, ...prev]);
       setActiveTrackId(tempTrackId);
     } catch (e) {
-      console.error("Failed to create track with watsonx Orchestrate:", e);
-      setIsOnline(false); // API failed, mark offline
+      console.error("Failed to create track locally:", e);
       setActiveTrackId("");
-      showToast("Connection to watsonx Orchestrate failed.");
+      showToast("Failed to initialize track.");
     } finally {
       setIsLoading(false);
     }
@@ -150,6 +190,14 @@ export default function App() {
     const text = (textToSend !== null ? textToSend : inputMessage).trim();
     if (!text || !activeTrack) return;
 
+    // B4 fix: guard against double-send while React state hasn't flushed yet
+    if (sendingRef.current) return;
+    sendingRef.current = true;
+
+    // B1 fix: capture the track id at call time and use it throughout
+    const currentTrackId = activeTrackId;
+    const currentTrack = activeTrack;
+
     // Reset input box if user typed it
     if (textToSend === null) {
       setInputMessage("");
@@ -157,72 +205,119 @@ export default function App() {
 
     // 1. Create and append User message
     const userMsg = { sender: "user", text };
-    const updatedMessages = [...activeTrack.messages, userMsg];
+    const updatedMessages = [...currentTrack.messages, userMsg];
 
-    // Optimistically update tracks local state immediately (rather than losing message)
+    // Check if diagnostic quiz assessment is in progress
+    const assessment = getAssessmentState(currentTrack);
+    const inProgress = isAssessmentInProgress(assessment);
+
+    if (inProgress) {
+      // PROCESS DIAGNOSTIC QUIZ LOCALLY
+      const { responseText, updatedAssessment, determinedStage } = processAssessmentAnswer(
+        currentTrack.name,
+        assessment,
+        text
+      );
+
+      const agentMsg = { sender: "agent", text: responseText };
+      const finalTrack = {
+        ...currentTrack,
+        stage: determinedStage || currentTrack.stage,
+        messages: [...updatedMessages, agentMsg],
+        assessment: updatedAssessment,
+        updatedAt: Date.now()
+      };
+
+      // Optimistically update tracks local state immediately
+      setTracks((prev) => {
+        const updated = prev.map((t) => (t.id === currentTrackId ? finalTrack : t));
+        const idx = updated.findIndex((t) => t.id === currentTrackId);
+        if (idx > 0) {
+          const [item] = updated.splice(idx, 1);
+          updated.unshift(item);
+        }
+        return updated;
+      });
+
+      setIsLoading(true);
+      try {
+        const saved = await dbService.saveTrack(sessionId, currentTrack.name, finalTrack);
+        setTracks((prev) => prev.map((t) => (t.id === currentTrackId ? { ...t, rev: saved.rev } : t)));
+      } catch (dbError) {
+        console.error("Cloudant CRUD: Failed to save local assessment step:", dbError);
+        showToast("Cloudant sync failed. Local history preserved.");
+      } finally {
+        setIsLoading(false);
+        sendingRef.current = false;
+      }
+      return;
+    }
+
+    // If assessment is already complete, use watsonx Orchestrate for general tutoring
     const updatedTrack = {
-      ...activeTrack,
+      ...currentTrack,
       messages: updatedMessages,
       updatedAt: Date.now()
     };
     
-    setTracks((prev) =>
-      prev
-        .map((t) => (t.id === activeTrack.id ? updatedTrack : t))
-        .sort((a, b) => b.updatedAt - a.updatedAt)
-    );
-
-    // 2. Cloudant CRUD: Save user message in active track document to DB
-    try {
-      await dbService.saveTrack(sessionId, activeTrack.name, updatedTrack);
-    } catch (dbError) {
-      console.error("Cloudant CRUD: Failed to save user message:", dbError);
-      showToast("Cloudant sync failed. Local history preserved.");
-    }
+    // Update local state with user message
+    setTracks((prev) => {
+      const updated = prev.map((t) => (t.id === currentTrackId ? updatedTrack : t));
+      const idx = updated.findIndex((t) => t.id === currentTrackId);
+      if (idx > 0) {
+        const [item] = updated.splice(idx, 1);
+        updated.unshift(item);
+      }
+      return updated;
+    });
 
     setIsLoading(true);
+    const userSavePromise = dbService.saveTrack(sessionId, currentTrack.name, updatedTrack)
+      .then((saved) => {
+        setTracks((prev) => prev.map((t) => (t.id === currentTrackId ? { ...t, rev: saved.rev } : t)));
+        return saved.rev;
+      })
+      .catch((dbError) => {
+        console.error("Cloudant CRUD: Failed to save user message:", dbError);
+        showToast("Cloudant sync failed. Local history preserved.");
+        return null;
+      });
 
     try {
-      // 3. watsonx Call: Query the agent chat completions API
       console.log(`watsonx Call: Fetching response for prompt: "${text}"`);
-      const response = await sendMessageToAgent(text, updatedMessages, activeTrack.name);
+      const [response, userSaveRev] = await Promise.all([
+        sendMessageToAgent(text, updatedMessages, currentTrack.name, currentTrack.stage),
+        userSavePromise
+      ]);
       setIsOnline(true); // Agent online
 
-      // 4. Scan agent response to check for skill level calibration keywords
-      let newStage = activeTrack.stage;
-      if (response.includes("**Intermediate**")) {
-        newStage = "Intermediate";
-      } else if (response.includes("**Beginner**")) {
-        newStage = "Beginner";
-      } else if (response.includes("**Advanced**")) {
-        newStage = "Advanced";
-      }
-
-      // 5. Create and append Agent response
       const agentMsg = { sender: "agent", text: response };
       const finalTrack = {
         ...updatedTrack,
-        stage: newStage,
+        rev: userSaveRev || updatedTrack.rev,
         messages: [...updatedMessages, agentMsg],
         updatedAt: Date.now()
       };
 
-      // 6. Cloudant CRUD: Save agent message to DB
+      let savedRev = finalTrack.rev;
       try {
-        await dbService.saveTrack(sessionId, activeTrack.name, finalTrack);
+        const saved = await dbService.saveTrack(sessionId, currentTrack.name, finalTrack);
+        savedRev = saved.rev;
       } catch (dbError) {
         console.error("Cloudant CRUD: Failed to save agent response:", dbError);
         showToast("Cloudant sync failed. Local history preserved.");
       }
 
-      // Re-load tracks list to update sidebar sorting and stages
-      setTracks((prev) =>
-        prev
-          .map((t) => (t.id === activeTrack.id ? finalTrack : t))
-          .sort((a, b) => b.updatedAt - a.updatedAt)
-      );
+      setTracks((prev) => {
+        const updated = prev.map((t) => (t.id === currentTrackId ? { ...finalTrack, rev: savedRev } : t));
+        const idx = updated.findIndex((t) => t.id === currentTrackId);
+        if (idx > 0) {
+          const [item] = updated.splice(idx, 1);
+          updated.unshift(item);
+        }
+        return updated;
+      });
     } catch (e) {
-      // watsonx call failed: set Agent Offline and append inline error bubble
       console.error("watsonx Call: Error communicating with completions API:", e);
       setIsOnline(false); // Mark offline
 
@@ -237,26 +332,32 @@ export default function App() {
         updatedAt: Date.now()
       };
 
-      // Sync state so the error message renders in the chat
       setTracks((prev) =>
-        prev.map((t) => (t.id === activeTrack.id ? errorTrack : t))
+        prev.map((t) => (t.id === currentTrackId ? errorTrack : t))
       );
     } finally {
       setIsLoading(false);
+      sendingRef.current = false;
     }
   };
 
   // Delete learning track
+  // P5 fix: remove track from local state directly instead of full fetchTracks() refetch
   const handleDeleteTrack = async (trackName) => {
+    // Remove from local state immediately for instant UI feedback
+    const deletedTrackId = `${sessionId}_${trackName}`;
+    setTracks((prev) => {
+      const remaining = prev.filter((t) => t.id !== deletedTrackId);
+      // If the deleted track was active, switch to the next available
+      if (activeTrackIdRef.current === deletedTrackId) {
+        setActiveTrackId(remaining.length > 0 ? remaining[0].id : "");
+      }
+      return remaining;
+    });
+
+    // Delete from Cloudant in the background
     try {
       await dbService.deleteTrack(sessionId, trackName);
-      const refreshed = await dbService.fetchTracks(sessionId);
-      setTracks(refreshed);
-      if (refreshed.length > 0) {
-        setActiveTrackId(refreshed[0].id);
-      } else {
-        setActiveTrackId("");
-      }
     } catch (e) {
       console.error("Cloudant CRUD: Delete track failed:", e);
       showToast("Failed to delete track document in Cloudant.");
@@ -285,6 +386,7 @@ export default function App() {
         onDeleteTrack={handleDeleteTrack}
         isOpen={sidebarOpen}
         setIsOpen={setSidebarOpen}
+        sessionId={sessionId}
       />
 
       {/* Main Chat Interface Area */}
